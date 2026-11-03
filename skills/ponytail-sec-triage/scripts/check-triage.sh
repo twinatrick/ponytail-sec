@@ -8,6 +8,10 @@
 # simple tokens, and block lists (`- "item"`) for anything with commas. Quote
 # strings with double quotes only.
 set -euo pipefail
+umask 077
+trap 'rm -f "${ev_tmp:-}" "${ev_next:-}"' EXIT INT TERM
+if [[ -L ".ponytail-sec" ]]; then echo "ERROR: .ponytail-sec must not be a symlink" >&2; exit 1; fi
+if [[ -d ".ponytail-sec" && ! -f ".ponytail-sec/.gitignore" ]]; then printf "*\n" > .ponytail-sec/.gitignore; fi
 
 json=0
 [ "${1:-}" = "--json" ] && { json=1; shift; }
@@ -33,16 +37,37 @@ for file in "${files[@]}"; do
   [ -f "$file" ] || { echo "$file: not a file" >&2; status=1; continue; }
   tdir=$(dirname "$file")
   # Evidence files that exist, relative to triage/, are passed as data.
+  if [ -L "$file" ]; then
+    echo "FAIL ${file##*/}:" >&2
+    echo "  - triage file must not be a symlink" >&2
+    status=1
+    continue
+  fi
   evidence=()
-  evidence_files='[]'
+  ev_tmp=$(mktemp)
+  printf '[]' > "$ev_tmp"
+  secret_err=""
+  if grep -Eq 'FAKE_SECRET_CANARY_[A-Za-z0-9_]+|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----' "$file"; then
+    secret_err="unmasked secret detected in report ${file##*/}"
+  fi
   while IFS= read -r -d '' epath; do
+    if [ -L "$epath" ]; then
+      secret_err="symlink not allowed in evidence: $epath"
+      continue
+    fi
     e=${epath#"$tdir"/}
     evidence+=("$e")
-    evidence_files=$(jq --arg path "$e" --rawfile content "$epath" \
-      '. + [{path: $path, content: $content}]' <<<"$evidence_files")
-  done < <(find "$tdir" -mindepth 2 -type f -print0)
+    if grep -Eq 'FAKE_SECRET_CANARY_[A-Za-z0-9_]+|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----' "$epath"; then
+      secret_err="unmasked secret detected in evidence file $e"
+    fi
+    ev_next=$(mktemp)
+    jq --arg path "$e" --rawfile content "$epath" \
+      '. + [{path: $path, content: $content}]' "$ev_tmp" > "$ev_next"
+    mv "$ev_next" "$ev_tmp"
+  done < <(find "$tdir" -mindepth 2 \( -type f -o -type l \) -print0)
 
-  result=$(jq -R -s --arg name "${file##*/}" --argjson evidence_files "$evidence_files" '
+  result=$(jq -R -s --arg name "${file##*/}" --slurpfile evidence_files_arr "$ev_tmp" '
+    ($evidence_files_arr[0]) as $evidence_files |
     def unq:
       if test("^\".*\"$") then (try fromjson catch error("bad quoted string: \(.)"))
       else . end;
@@ -59,8 +84,8 @@ for file in "${files[@]}"; do
       split("\n") as $l
       | if $l[0] != "---" then error("no YAML frontmatter") else . end
       | (first(range(1; $l | length) as $i | select($l[$i] == "---") | $i)
-         // error("frontmatter is not closed")) as $end
-      | reduce $l[1:$end][] as $line ({obj: {}, cur: null};
+         // error("frontmatter is not closed")) as $end_idx
+      | reduce $l[1:$end_idx][] as $line ({obj: {}, cur: null};
           if ($line | test("^\\s*(#.*)?$")) then .
           elif ($line | test("^[A-Za-z_][A-Za-z0-9_]*:")) then
             ($line | capture("^(?<k>[A-Za-z_][A-Za-z0-9_]*):(?<v>.*)$")) as $m
@@ -205,8 +230,21 @@ for file in "${files[@]}"; do
     | .fm += (if .fm then {report: $name} else null end)
   ' "$file" --args ${evidence[@]+"${evidence[@]}"})
 
+  rm -f "$ev_tmp"
+  cvss_err=""
+  if [ "$(jq -r '.fm.class // empty' <<<"$result")" = "vulnerability" ]; then
+    cvss_vec=$(jq -r '.fm.cvss // empty' <<<"$result")
+    cvss_sc=$(jq -r '.fm.cvss_score // empty' <<<"$result")
+    if [ -n "$cvss_vec" ] && [ -n "$cvss_sc" ]; then
+      if ! cvss_out=$(node "$(dirname "$0")/cvss4-calc.mjs" "$cvss_vec" "$cvss_sc" 2>&1); then
+        cvss_err="$cvss_out"
+      fi
+    fi
+  fi
   # Errors can quote file content; strip control characters before printing.
-  errors=$(jq -r '.errors[] | gsub("[\u0000-\u001f\u007f]"; "?")' <<<"$result")
+  errors=$(jq -r '.errors[] | gsub("[\u0000-\u001f\u007f-\u009f]"; "?")' <<<"$result")
+  if [ -n "$cvss_err" ]; then errors=$(printf '%s\n%s' "$errors" "$cvss_err" | sed '/^$/d'); fi
+  if [ -n "$secret_err" ]; then errors=$(printf '%s\n%s' "$errors" "$secret_err" | sed '/^$/d'); fi
   if [ -n "$errors" ]; then
     while IFS= read -r e; do printf '%s: %s\n' "$file" "$e"; done <<<"$errors" >&2
     status=1

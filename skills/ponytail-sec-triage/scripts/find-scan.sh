@@ -3,6 +3,9 @@
 # or --scan <dir>. Rejects schema v2 and warns on a findings_sha256 mismatch.
 # Read-only. Usage: find-scan.sh [--scan <dir>]
 set -euo pipefail
+umask 077
+if [[ -L ".ponytail-sec" ]]; then echo "ERROR: .ponytail-sec must not be a symlink" >&2; exit 1; fi
+if [[ -d ".ponytail-sec" && ! -f ".ponytail-sec/.gitignore" ]]; then printf "*\n" > .ponytail-sec/.gitignore; fi
 
 die() { echo "Error: $*" >&2; exit 1; }
 
@@ -39,6 +42,6 @@ else
 fi
 expected=$(jq -r '.findings_sha256 // empty' "$scan/meta.json")
 [ "$actual" = "$expected" ] ||
-  echo "WARNING: findings_sha256 mismatch; findings.json changed after the audit." >&2
+  die "findings_sha256 mismatch; findings.json changed after the audit."
 
 printf '%s\n' "$scan"
